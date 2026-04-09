@@ -1,0 +1,31 @@
+# =============================================================================
+# VOICE ASSISTANT DEPENDENCIES
+# =============================================================================
+# Install with: pip install -r requirements.txt
+# 
+# Note: Some packages may require system dependencies (see setup.sh)
+# =============================================================================
+
+# Audio I/O
+sounddevice>=0.4.6
+
+# Wake Word Detection (fully local, open-source, no API key!)
+openwakeword>=0.6.0
+
+# Local Speech-to-Text (faster-whisper)
+faster-whisper>=1.0.0
+
+# LLM (Google Gemini)
+google-genai>=0.1.0
+
+# Text-to-Speech (ElevenLabs)
+elevenlabs>=1.0.0
+
+# Numerical operations (usually pre-installed)
+numpy>=1.24.0
+
+# ONNX runtime for openwakeword (CPU optimized)
+onnxruntime>=1.15.0
+
+# For loading .env files
+python-dotenv>=1.0.0
