@@ -29,6 +29,8 @@ from dotenv import load_dotenv
 from typing import Generator, Optional
 import numpy as np
 
+load_dotenv(".env.local")
+
 # =============================================================================
 # API KEYS - LOADED FROM .ENV.LOCAL
 # =============================================================================
@@ -875,7 +877,6 @@ class VoiceAssistant:
 
 def main():
     """Main entry point."""
-    load_dotenv(".env.local")
     print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║           🎙️  RASPBERRY PI VOICE ASSISTANT 🎙️              ║
