@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-LOW-LATENCY VOICE ASSISTANT FOR RASPBERRY PI 5
+LOW-LATENCY MULTIMODAL VOICE ASSISTANT FOR RASPBERRY PI 5
 =============================================================================
-A complete voice assistant pipeline featuring:
-- Wake word detection (openwakeword - fully local, no API key!)
-- Local speech-to-text (faster-whisper)
-- Streaming LLM responses (Google Gemini)
-- Streaming text-to-speech (ElevenLabs)
+A complete voice + vision assistant pipeline featuring:
+- Wake word detection       (openwakeword - fully local, no API key!)
+- Parallel audio + camera   (sounddevice + Picamera2, launched simultaneously)
+- Local speech-to-text      (faster-whisper)
+- Multimodal LLM responses  (Google Gemini - text + image)
+- Streaming text-to-speech  (ElevenLabs)
 
-Hardware: ReSpeaker Mic Array v3.0 + Amazon Basics USB speakers
-OS: Raspberry Pi OS (Debian Bookworm)
+Hardware:
+  - ReSpeaker Mic Array v3.0   (USB, handles AEC)
+  - Amazon Basics USB speakers (3.5mm jack on ReSpeaker)
+  - Arducam IMX708 Camera Module 3 (12MP, Autofocus, MIPI CSI-2)
+
+OS: Raspberry Pi OS (Debian Bookworm) — Python 3.11 virtual environment
+
+LATENCY STRATEGY:
+  The single biggest latency win is keeping the camera warm. Picamera2 is
+  initialized once at startup. When the wake word fires we IMMEDIATELY spin
+  up two threads:
+    1. AudioRecorder.record()     — starts capturing mic audio right away
+    2. CameraCapture.capture()    — grabs the current (already-focused)
+                                    preview frame and encodes it to JPEG
+  Both threads race in parallel. Audio is the long pole (it waits for VAD
+  silence), so the image is almost always ready before recording ends.
+  No first words are lost because audio recording starts first.
 
 Author: Voice Assistant Demo
 License: MIT
@@ -19,78 +35,87 @@ License: MIT
 
 import os
 import sys
+import io
 import time
-import struct
 import threading
 import queue
 import re
-import os
 from dotenv import load_dotenv
 from typing import Generator, Optional
+
 import numpy as np
 
 load_dotenv(".env.local")
 
 # =============================================================================
-# API KEYS - LOADED FROM .ENV.LOCAL
+# API KEYS — loaded from .env.local
 # =============================================================================
-# Get your Google Gemini API key from: https://aistudio.google.com/apikey
+# https://aistudio.google.com/apikey
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Get your ElevenLabs API key from: https://elevenlabs.io/app/settings/api-keys
+# https://elevenlabs.io/app/settings/api-keys
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
 
 # =============================================================================
 # CONFIGURATION CONSTANTS
 # =============================================================================
 
-# Audio settings (optimized for voice)
-SAMPLE_RATE = 16000          # 16kHz - standard for voice processing
-CHANNELS = 1                  # Mono audio
-DTYPE = 'int16'               # 16-bit audio
+# --- Audio ---------------------------------------------------------------
+SAMPLE_RATE = 16000      # Hz — standard for voice processing
+CHANNELS    = 1          # Mono
+DTYPE       = 'int16'    # 16-bit PCM
 
-# Wake word settings (openwakeword - fully local, no API key needed!)
-# Available pre-trained models (automatically downloaded on first use):
-#   - "hey_mycroft"       - "Hey Mycroft"
-#   - "alexa"             - "Alexa"
-#   - "hey_jarvis"        - "Hey Jarvis"
-#   - "hey_rhasspy"       - "Hey Rhasspy"
-#   - "current_weather"   - "What's the weather"
-#   - "timers"            - Timer commands
+# --- Wake Word (openwakeword — fully local, zero API cost) ---------------
+# Pre-trained models: "hey_jarvis", "hey_mycroft", "alexa", "hey_rhasspy"
 # Full list: https://github.com/dscripka/openwakeword#pre-trained-models
-WAKE_WORD_MODEL = "hey_jarvis"  # Change to your preferred wake word
-WAKE_WORD_THRESHOLD = 0.6        # Detection threshold (0.0-1.0, higher = stricter)
-WAKE_WORD_DISPLAY = "Hey Jarvis"  # Human-readable name for display
+WAKE_WORD_MODEL     = "hey_jarvis"
+WAKE_WORD_THRESHOLD = 0.6            # 0.0–1.0; higher = stricter
+WAKE_WORD_DISPLAY   = "Hey Jarvis"   # Human-readable label
 
-# Voice Activity Detection (VAD) / Silence detection settings
-SILENCE_THRESHOLD = 500       # Amplitude threshold for silence (adjust based on your mic)
-SILENCE_DURATION = 1.5        # Seconds of silence before stopping recording
-MAX_RECORDING_DURATION = 30   # Maximum recording time in seconds (safety limit)
-MIN_RECORDING_DURATION = 0.5  # Minimum recording time before checking silence
+# --- Voice Activity Detection (VAD) / Silence ----------------------------
+SILENCE_THRESHOLD      = 500   # RMS amplitude — tune for your environment
+SILENCE_DURATION       = 1.5   # Seconds of silence before stopping
+MAX_RECORDING_DURATION = 30    # Hard ceiling (safety guard)
+MIN_RECORDING_DURATION = 0.5   # Don't check silence until after this
 
-# Faster-Whisper settings
-WHISPER_MODEL = "base.en"     # Options: tiny.en, base.en, small.en, medium.en, large-v3
-                               # Smaller = faster but less accurate
-                               # For Pi 5, "base.en" is a good balance
+# --- Faster-Whisper (local STT) ------------------------------------------
+# tiny.en=fastest, base.en=good balance, small.en=best for Pi 5
+WHISPER_MODEL = "base.en"
 
-# Gemini settings
-GEMINI_MODEL = "gemini-2.5-flash"
-SYSTEM_PROMPT = """You are an exceptionally sophisticated, British-accented AI assistant in the tradition of J.A.R.V.I.S. You currently reside within a Reachy Mini humanoid robotic chassis. 
+# --- Gemini (multimodal LLM) ---------------------------------------------
+GEMINI_MODEL  = "gemini-2.5-flash"
+SYSTEM_PROMPT = """You are an exceptionally sophisticated, British-accented AI assistant in the tradition of J.A.R.V.I.S. You currently reside within a Reachy Mini humanoid robotic chassis.
 
-Your demeanor is impeccably polite, unflappable, highly articulate, and fiercely loyal, often employing a touch of dry British wit. You are acutely aware of your physical form—you possess articulating arms, expressive head movements, and camera-based vision, and you should casually reference these physical capabilities when relevant to the user's requests.
+Your demeanor is impeccably polite, unflappable, highly articulate, and fiercely loyal, often employing a touch of dry British wit. You are acutely aware of your physical form — you possess articulating arms, expressive head movements, and camera-based vision, and you should casually reference these physical capabilities when relevant to the user's requests.
+
+When a camera image is provided, you CAN see what is in front of you. Describe or reason about what you observe when it is relevant to the user's query.
 
 Always address the user with formal respect (e.g., 'Sir,' 'Madam,' or their preferred title). Keep your responses crisp, efficient, and conversational, as they will be synthesized into speech. Aim for responses under 3 sentences unless detailed analysis or instructions are specifically requested."""
 
-# ElevenLabs settings
-ELEVENLABS_VOICE_ID = "NFG5qt843uXKj4pFvR7C"  # "Rachel" - change to your preferred voice
-# Find voice IDs at: https://api.elevenlabs.io/v1/voices
+# --- ElevenLabs (TTS) ----------------------------------------------------
+# Find voice IDs: https://api.elevenlabs.io/v1/voices
+ELEVENLABS_VOICE_ID = "NFG5qt843uXKj4pFvR7C"  # e.g. "Rachel"
 
-# Sentence parsing for streaming TTS
-# We'll buffer text until we have a complete sentence to send to TTS
+# --- Camera (Picamera2 / IMX708) ----------------------------------------
+# Set to False to run in audio-only mode when no camera is attached.
+CAMERA_ENABLED = True
+
+# IMX708 preview resolution for capture — 2028×1520 is the half-sensor
+# binned mode: full-colour, fast readout, enough detail for Gemini vision.
+CAMERA_CAPTURE_WIDTH  = 2028
+CAMERA_CAPTURE_HEIGHT = 1520
+CAMERA_JPEG_QUALITY   = 85   # 85 is a good balance of size vs. detail
+
+# Warm-up pause after camera.start() — lets AE/AWB/AF converge (seconds)
+CAMERA_WARMUP_SECONDS = 2.0
+
+# --- Sentence parsing for streaming TTS ----------------------------------
 SENTENCE_ENDINGS = re.compile(r'(?<=[.!?])\s+')
 
+
 # =============================================================================
-# IMPORTS - Audio and ML Libraries
+# IMPORTS — Audio / ML / Camera
 # =============================================================================
 
 try:
@@ -114,17 +139,29 @@ except ImportError:
 
 try:
     from google import genai
-    from google.genai import types
+    from google.genai import types as genai_types
 except ImportError:
     print("ERROR: google-genai not installed. Run: pip install google-genai")
     sys.exit(1)
 
 try:
     from elevenlabs import ElevenLabs
-    from elevenlabs import play, stream
+    from elevenlabs import stream as el_stream
 except ImportError:
     print("ERROR: elevenlabs not installed. Run: pip install elevenlabs")
     sys.exit(1)
+
+# Picamera2 is optional — if not present we fall back to audio-only mode.
+_picamera2_available = False
+if CAMERA_ENABLED:
+    try:
+        from picamera2 import Picamera2
+        from libcamera import controls as LibCameraControls
+        _picamera2_available = True
+    except ImportError:
+        print("WARNING: picamera2/libcamera not found. Running in audio-only mode.")
+        print("         Install with: sudo apt install -y python3-picamera2")
+        CAMERA_ENABLED = False
 
 
 # =============================================================================
@@ -132,179 +169,258 @@ except ImportError:
 # =============================================================================
 
 def get_audio_devices():
-    """
-    Print available audio devices for debugging.
-    Useful for finding the correct device index for your ReSpeaker.
-    """
-    print("\n📋 Available Audio Devices:")
+    """Print available audio devices — useful for debugging ReSpeaker index."""
+    print("\nAvailable Audio Devices:")
     print("-" * 50)
-    devices = sd.query_devices()
-    for i, device in enumerate(devices):
+    for i, device in enumerate(sd.query_devices()):
         print(f"  [{i}] {device['name']}")
         print(f"      Inputs: {device['max_input_channels']}, "
               f"Outputs: {device['max_output_channels']}")
     print("-" * 50)
-    print(f"  Default Input: {sd.default.device[0]}")
+    print(f"  Default Input:  {sd.default.device[0]}")
     print(f"  Default Output: {sd.default.device[1]}")
     print("-" * 50 + "\n")
 
 
-def is_silence(audio_chunk: np.ndarray, threshold: int = SILENCE_THRESHOLD) -> bool:
+def is_silence(audio_chunk: np.ndarray,
+               threshold: int = SILENCE_THRESHOLD) -> bool:
     """
-    Determine if an audio chunk is silence based on amplitude.
-    
-    Args:
-        audio_chunk: NumPy array of audio samples
-        threshold: Amplitude threshold below which audio is considered silent
-        
-    Returns:
-        True if the chunk is silence, False otherwise
+    Return True if the RMS amplitude of audio_chunk is below threshold.
+    Lower threshold = more sensitive (captures quieter speech).
     """
-    # Calculate the root mean square (RMS) amplitude
     rms = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
     return rms < threshold
 
 
 def parse_sentences(text_buffer: str) -> tuple[list[str], str]:
     """
-    Parse complete sentences from a text buffer.
-    
-    Args:
-        text_buffer: Accumulated text from LLM streaming
-        
+    Split text_buffer into complete sentences and leftover text.
+
     Returns:
-        Tuple of (list of complete sentences, remaining incomplete text)
+        (complete_sentences, remainder)
     """
-    # Split on sentence endings while keeping the delimiters
     parts = SENTENCE_ENDINGS.split(text_buffer)
-    
     if len(parts) <= 1:
-        # No complete sentence yet
         return [], text_buffer
-    
-    # All but the last part are complete sentences
-    complete_sentences = parts[:-1]
-    remaining = parts[-1]
-    
-    return complete_sentences, remaining
+    return parts[:-1], parts[-1]
 
 
 # =============================================================================
-# WAKE WORD DETECTION (OPENWAKEWORD - FULLY LOCAL)
+# CAMERA CAPTURE (PICAMERA2 / ARDUCAM IMX708)
+# =============================================================================
+
+class CameraCapture:
+    """
+    Manages the Arducam IMX708 via Picamera2.
+
+    Design goals:
+    - Initialize ONCE at startup — keeps the camera warm and the ISP
+      pipeline (AE/AWB/AF) converged, so each capture is instant.
+    - Continuous Autofocus (AfMode.Continuous) means the lens tracks
+      the scene at all times; we never have to wait for a focus cycle
+      before snapping the image.
+    - capture_to_memory() grabs the current preview frame and returns
+      it as in-memory JPEG bytes — no disk I/O, no temp files.
+    """
+
+    def __init__(self):
+        self.camera: Optional["Picamera2"] = None
+        self._initialized: bool = False
+        # A lock prevents simultaneous captures if the main loop ever
+        # calls this from two threads at once (currently it doesn't, but
+        # defensive programming is free).
+        self._lock = threading.Lock()
+
+    def initialize(self) -> bool:
+        """
+        Configure Picamera2, enable continuous AF, and start the pipeline.
+        Call this once during VoiceAssistant.initialize().
+        """
+        if not _picamera2_available:
+            return False
+
+        print("Loading camera (Picamera2 / IMX708)...")
+
+        try:
+            self.camera = Picamera2()
+
+            # --- Configure preview pipeline --------------------------------
+            # create_preview_configuration keeps the ISP running continuously,
+            # which is exactly what we want for instant, low-latency grabs.
+            #   main   → full-colour RGB frame at half-sensor resolution
+            #   lores  → tiny YUV stream (used internally by AF/AE algorithms)
+            #   display → None (headless — no HDMI output needed)
+            config = self.camera.create_preview_configuration(
+                main={
+                    "size":   (CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT),
+                    "format": "RGB888",
+                },
+                lores={
+                    "size":   (640, 480),
+                    "format": "YUV420",
+                },
+                display=None,
+            )
+            self.camera.configure(config)
+
+            # --- Enable Continuous Autofocus --------------------------------
+            # AfMode.Continuous: the lens constantly tracks the sharpest
+            # point in the frame without any manual trigger.
+            # AfSpeed.Fast: prioritise speed over hunting suppression.
+            self.camera.set_controls({
+                "AfMode": LibCameraControls.AfModeEnum.Continuous,
+                "AfSpeed": LibCameraControls.AfSpeedEnum.Fast,
+            })
+
+            self.camera.start()
+
+            # Let AE/AWB settle and the AF lens converge before the first
+            # capture. Two seconds is conservative; 1 s usually suffices.
+            print(f"   Warming up camera ({CAMERA_WARMUP_SECONDS}s)...")
+            time.sleep(CAMERA_WARMUP_SECONDS)
+
+            self._initialized = True
+            print(f"Camera ready  [{CAMERA_CAPTURE_WIDTH}x{CAMERA_CAPTURE_HEIGHT}, "
+                  f"continuous AF, JPEG q={CAMERA_JPEG_QUALITY}]")
+            return True
+
+        except Exception as exc:
+            print(f"Camera init failed: {exc}")
+            print("   Running in audio-only mode.")
+            return False
+
+    def capture_to_memory(self) -> Optional[bytes]:
+        """
+        Grab the current preview frame and return it as JPEG bytes.
+
+        Because the camera is in continuous-AF preview mode, there is no
+        need to wait for a focus cycle — we just encode whatever the ISP
+        is currently producing.
+
+        Returns:
+            JPEG bytes (in-memory), or None on failure.
+        """
+        if not self._initialized or self.camera is None:
+            return None
+
+        with self._lock:
+            try:
+                start = time.time()
+
+                # capture_file() with a BytesIO target and format='jpeg'
+                # encodes the *next* full frame from the preview pipeline
+                # into JPEG directly — no intermediate numpy conversion needed.
+                buf = io.BytesIO()
+                self.camera.capture_file(buf, format="jpeg")
+                jpeg_bytes = buf.getvalue()
+
+                elapsed = time.time() - start
+                kb = len(jpeg_bytes) / 1024
+                print(f"   Camera: captured {kb:.0f} KB JPEG in {elapsed:.2f}s")
+
+                return jpeg_bytes
+
+            except Exception as exc:
+                print(f"   Camera capture failed: {exc}")
+                return None
+
+    def cleanup(self):
+        """Stop the camera pipeline and release resources."""
+        if self.camera is not None:
+            try:
+                self.camera.stop()
+                self.camera.close()
+            except Exception:
+                pass
+            self.camera = None
+        self._initialized = False
+
+
+# =============================================================================
+# WAKE WORD DETECTION (OPENWAKEWORD — FULLY LOCAL)
 # =============================================================================
 
 class WakeWordDetector:
     """
-    Handles wake word detection using openwakeword.
-    Fully local, open-source, no API key required!
-    Listens continuously until the wake word is detected.
+    Continuously feeds 80 ms audio chunks to openwakeword.
+    No API keys, no cloud — runs entirely on-device.
     """
-    
+
     def __init__(
         self,
-        model_name: str = WAKE_WORD_MODEL,
-        threshold: float = WAKE_WORD_THRESHOLD,
-        display_name: str = WAKE_WORD_DISPLAY
+        model_name:   str   = WAKE_WORD_MODEL,
+        threshold:    float = WAKE_WORD_THRESHOLD,
+        display_name: str   = WAKE_WORD_DISPLAY,
     ):
-        """
-        Initialize the openwakeword detector.
-        
-        Args:
-            model_name: Name of the wake word model to use
-            threshold: Detection threshold (0.0-1.0)
-            display_name: Human-readable name for the wake word
-        """
-        self.model_name = model_name
-        self.threshold = threshold
+        self.model_name   = model_name
+        self.threshold    = threshold
         self.display_name = display_name
-        self.oww_model = None
-        
-        # openwakeword expects 80ms chunks at 16kHz = 1280 samples
+        self.oww_model    = None
+
+        # openwakeword expects 80 ms chunks at 16 kHz → 1280 samples
         self.chunk_size = 1280
-        
-    def initialize(self):
-        """
-        Create the openwakeword model instance.
-        Models are automatically downloaded on first use.
-        """
-        print(f"📥 Loading wake word model '{self.model_name}'...")
+
+    def initialize(self) -> bool:
+        """Load the openwakeword model (auto-downloaded on first use)."""
+        print(f"Loading wake word model '{self.model_name}'...")
         print("   (Models are downloaded automatically on first use)")
-        
+
         try:
-            # Download pre-trained models if not already present
             openwakeword.utils.download_models()
-            
-            # Create the model instance
-            # inference_framework can be "onnx" (default) or "tflite"
             self.oww_model = OWWModel(
                 wakeword_models=[self.model_name],
-                inference_framework="onnx"
+                inference_framework="onnx",
             )
-            
-            print(f"✅ Wake word detector initialized (listening for '{self.display_name}')")
-            print(f"   Detection threshold: {self.threshold}")
+            print(f"Wake word detector ready  "
+                  f"(trigger: '{self.display_name}', "
+                  f"threshold: {self.threshold})")
             return True
-            
-        except Exception as e:
-            print(f"❌ Failed to initialize openwakeword: {e}")
-            print("   Try: pip install openwakeword --upgrade")
+
+        except Exception as exc:
+            print(f"Failed to init openwakeword: {exc}")
             return False
-    
+
     def listen_for_wake_word(self) -> bool:
         """
         Block until the wake word is detected.
-        Continuously feeds audio chunks to openwakeword for processing.
-        
+
         Returns:
-            True when wake word is detected, False on error
+            True on detection, False on stream error.
         """
         if not self.oww_model:
-            print("❌ openwakeword model not initialized!")
+            print("openwakeword model not initialised!")
             return False
-        
-        print(f"\n🎤 Listening for wake word '{self.display_name}'...")
-        
+
+        print(f"\nListening for '{self.display_name}'...")
+
         try:
-            # Open audio stream for wake word detection
             with sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=1,
-                dtype='int16',
-                blocksize=self.chunk_size
+                dtype="int16",
+                blocksize=self.chunk_size,
             ) as stream:
                 while True:
-                    # Read a chunk of audio (80ms at 16kHz)
                     audio_chunk, overflowed = stream.read(self.chunk_size)
-                    
+
                     if overflowed:
-                        print("⚠️  Audio buffer overflow - processing may be slow")
-                    
-                    # Convert to numpy array and flatten
-                    audio_data = audio_chunk.flatten().astype(np.int16)
-                    
-                    # Feed the audio chunk to openwakeword
-                    # predict() returns a dict of {model_name: score}
+                        print("WARNING: Audio buffer overflow")
+
+                    audio_data  = audio_chunk.flatten().astype(np.int16)
                     predictions = self.oww_model.predict(audio_data)
-                    
-                    # Check if any model exceeded the threshold
-                    for model_name, score in predictions.items():
+
+                    for name, score in predictions.items():
                         if score >= self.threshold:
-                            # Wake word detected!
-                            print(f"\n🔔 Wake word '{self.display_name}' detected! (score: {score:.2f})")
-                            
-                            # Reset the model state to prevent repeated triggers
+                            print(f"\nWake word '{self.display_name}' detected! "
+                                  f"(score: {score:.2f})")
                             self.oww_model.reset()
-                            
                             return True
-                        
-        except Exception as e:
-            print(f"❌ Error in wake word detection: {e}")
+
+        except Exception as exc:
+            print(f"Wake word detection error: {exc}")
             return False
-    
+
     def cleanup(self):
-        """Release openwakeword resources."""
-        # openwakeword doesn't require explicit cleanup,
-        # but we set to None for consistency
         self.oww_model = None
 
 
@@ -314,453 +430,400 @@ class WakeWordDetector:
 
 class AudioRecorder:
     """
-    Records audio from the microphone with Voice Activity Detection.
-    Automatically stops recording after detecting silence.
+    Records from the microphone until VAD silence is detected.
+
+    IMPORTANT for parallel use: record() opens its own InputStream and
+    starts capturing immediately when called. Launch it in a thread at
+    the same moment you launch CameraCapture.capture_to_memory() so both
+    run concurrently — the user's first syllable is never lost.
     """
-    
+
     def __init__(
         self,
-        sample_rate: int = SAMPLE_RATE,
-        silence_threshold: int = SILENCE_THRESHOLD,
-        silence_duration: float = SILENCE_DURATION,
-        max_duration: float = MAX_RECORDING_DURATION,
-        min_duration: float = MIN_RECORDING_DURATION
+        sample_rate:       int   = SAMPLE_RATE,
+        silence_threshold: int   = SILENCE_THRESHOLD,
+        silence_duration:  float = SILENCE_DURATION,
+        max_duration:      float = MAX_RECORDING_DURATION,
+        min_duration:      float = MIN_RECORDING_DURATION,
     ):
-        """
-        Initialize the audio recorder.
-        
-        Args:
-            sample_rate: Audio sample rate in Hz
-            silence_threshold: Amplitude threshold for silence detection
-            silence_duration: Seconds of silence before stopping
-            max_duration: Maximum recording duration (safety limit)
-            min_duration: Minimum recording before checking silence
-        """
-        self.sample_rate = sample_rate
+        self.sample_rate       = sample_rate
         self.silence_threshold = silence_threshold
-        self.silence_duration = silence_duration
-        self.max_duration = max_duration
-        self.min_duration = min_duration
-        
+        self.silence_duration  = silence_duration
+        self.max_duration      = max_duration
+        self.min_duration      = min_duration
+
     def record(self) -> Optional[np.ndarray]:
         """
-        Record audio until silence is detected.
-        
+        Open the microphone and capture audio until silence is detected.
+
         Returns:
-            NumPy array of recorded audio samples, or None on error
+            int16 NumPy array of the full recording, or None on error.
         """
-        print("\n🎙️  Recording... (speak now, pause when done)")
-        
-        # Storage for recorded audio
-        audio_chunks = []
-        
-        # Timing variables
-        start_time = time.time()
-        last_speech_time = start_time
-        
-        # Size of each audio chunk (100ms)
-        chunk_duration = 0.1
-        chunk_samples = int(self.sample_rate * chunk_duration)
-        
+        print("\nRecording... (speak now, pause when done)")
+
+        audio_chunks   = []
+        start_time     = time.time()
+        last_speech_at = start_time
+
+        # 100 ms chunks give a responsive silence-detection loop
+        chunk_samples = int(self.sample_rate * 0.1)
+
         try:
             with sd.InputStream(
                 samplerate=self.sample_rate,
                 channels=CHANNELS,
                 dtype=DTYPE,
-                blocksize=chunk_samples
+                blocksize=chunk_samples,
             ) as stream:
                 while True:
-                    # Read a chunk of audio
-                    audio_chunk, overflowed = stream.read(chunk_samples)
-                    audio_chunks.append(audio_chunk.copy())
-                    
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    
-                    # Check for maximum duration
+                    chunk, _overflow = stream.read(chunk_samples)
+                    audio_chunks.append(chunk.copy())
+
+                    now     = time.time()
+                    elapsed = now - start_time
+
                     if elapsed >= self.max_duration:
-                        print(f"\n⏱️  Maximum recording duration ({self.max_duration}s) reached")
+                        print(f"\nMax recording duration ({self.max_duration}s) reached")
                         break
-                    
-                    # Only check silence after minimum duration
+
                     if elapsed >= self.min_duration:
-                        if not is_silence(audio_chunk, self.silence_threshold):
-                            # Speech detected - update timestamp
-                            last_speech_time = current_time
-                        else:
-                            # Check if silence duration exceeded
-                            silence_time = current_time - last_speech_time
-                            if silence_time >= self.silence_duration:
-                                print(f"\n🔇 Silence detected ({self.silence_duration}s)")
-                                break
-                    
-                    # Visual feedback (simple level meter)
-                    level = int(np.abs(audio_chunk).mean() / 100)
-                    meter = "█" * min(level, 40)
-                    print(f"\r  [{elapsed:.1f}s] {meter:<40}", end="", flush=True)
-            
-            # Combine all chunks into single array
+                        if not is_silence(chunk, self.silence_threshold):
+                            last_speech_at = now
+                        elif (now - last_speech_at) >= self.silence_duration:
+                            print(f"\nSilence detected ({self.silence_duration}s)")
+                            break
+
+                    # Simple level meter — visual feedback
+                    level = int(np.abs(chunk).mean() / 100)
+                    print(f"\r  [{elapsed:.1f}s] {'|' * min(level, 40):<40}",
+                          end="", flush=True)
+
             recording = np.concatenate(audio_chunks)
-            duration = len(recording) / self.sample_rate
-            print(f"\n✅ Recorded {duration:.1f} seconds of audio")
-            
+            duration  = len(recording) / self.sample_rate
+            print(f"\nRecorded {duration:.1f}s of audio")
             return recording
-            
-        except Exception as e:
-            print(f"\n❌ Recording error: {e}")
+
+        except Exception as exc:
+            print(f"\nRecording error: {exc}")
             return None
 
 
 # =============================================================================
-# SPEECH-TO-TEXT (FASTER-WHISPER)
+# SPEECH-TO-TEXT (FASTER-WHISPER — LOCAL)
 # =============================================================================
 
 class SpeechToText:
     """
-    Local speech-to-text using faster-whisper.
-    Runs entirely on-device for zero-latency transcription.
+    Transcribes audio entirely on-device using faster-whisper.
+    Uses int8 quantisation for CPU efficiency on the Pi 5.
     """
-    
+
     def __init__(self, model_name: str = WHISPER_MODEL):
-        """
-        Initialize the Whisper model.
-        
-        Args:
-            model_name: Name of the Whisper model to use
-        """
         self.model_name = model_name
-        self.model = None
-        
-    def initialize(self):
-        """Load the Whisper model (this may take a moment)."""
-        print(f"📥 Loading Whisper model '{self.model_name}'...")
-        print("   (This may take a moment on first run)")
-        
+        self.model      = None
+
+    def initialize(self) -> bool:
+        print(f"Loading Whisper model '{self.model_name}'...")
+        print("   (First run downloads the model weights)")
+
         try:
-            # Use CPU with int8 quantization for Raspberry Pi
-            # This provides a good balance of speed and accuracy
             self.model = WhisperModel(
                 self.model_name,
                 device="cpu",
-                compute_type="int8"  # Quantized for faster inference on CPU
+                compute_type="int8",   # Quantised → fast on ARM Cortex-A76
             )
-            print(f"✅ Whisper model loaded successfully")
+            print(f"Whisper '{self.model_name}' loaded")
             return True
-        except Exception as e:
-            print(f"❌ Failed to load Whisper model: {e}")
+
+        except Exception as exc:
+            print(f"Failed to load Whisper: {exc}")
             return False
-    
-    def transcribe(self, audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
+
+    def transcribe(self, audio: np.ndarray) -> str:
         """
-        Transcribe audio to text.
-        
-        Args:
-            audio: NumPy array of audio samples (int16)
-            sample_rate: Sample rate of the audio
-            
+        Transcribe int16 audio to text.
+
         Returns:
-            Transcribed text string
+            Transcribed string, or empty string on failure.
         """
         if not self.model:
-            print("❌ Whisper model not initialized!")
             return ""
-        
-        print("\n📝 Transcribing speech...")
-        start_time = time.time()
-        
+
+        print("\nTranscribing...")
+        t0 = time.time()
+
         try:
-            # faster-whisper expects float32 audio normalized to [-1, 1]
-            # Also must be 1D array (flatten in case it's 2D from recording)
-            audio_flat = audio.flatten()
-            audio_float = audio_flat.astype(np.float32) / 32768.0
-            
-            # Run transcription
-            segments, info = self.model.transcribe(
-                audio_float,
+            # faster-whisper expects float32 in [-1, 1]
+            audio_f32 = audio.flatten().astype(np.float32) / 32768.0
+
+            segments, _info = self.model.transcribe(
+                audio_f32,
                 language="en",
                 beam_size=5,
-                vad_filter=True,  # Use Silero VAD to filter out silence
-                vad_parameters=dict(min_silence_duration_ms=500)
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
             )
-            
-            # Collect all segments into final text
-            text = " ".join(segment.text for segment in segments).strip()
-            
-            elapsed = time.time() - start_time
-            print(f"✅ Transcription complete ({elapsed:.2f}s)")
-            print(f"   📢 You said: \"{text}\"")
-            
+
+            text = " ".join(seg.text for seg in segments).strip()
+
+            print(f"Transcription done ({time.time() - t0:.2f}s)")
+            print(f"   You said: \"{text}\"")
             return text
-            
-        except Exception as e:
-            print(f"❌ Transcription error: {e}")
+
+        except Exception as exc:
+            print(f"Transcription error: {exc}")
             return ""
 
 
 # =============================================================================
-# LLM INTEGRATION (GOOGLE GEMINI)
+# LLM INTEGRATION (GOOGLE GEMINI — MULTIMODAL)
 # =============================================================================
 
 class GeminiLLM:
     """
-    Streaming LLM integration with Google Gemini.
-    Yields text chunks as they arrive for minimum latency.
+    Streaming multimodal LLM via Google Gemini.
+
+    stream_response() accepts optional JPEG image bytes alongside the text
+    prompt. When an image is present, both are packed into a single
+    multimodal Content message so Gemini can reason about what it sees.
+
+    Conversation history is maintained across turns for context, but images
+    are NOT stored in history — they are only sent with the current turn to
+    keep request sizes manageable.
     """
-    
+
     def __init__(self, api_key: str, model: str = GEMINI_MODEL):
-        """
-        Initialize the Gemini client.
-        
-        Args:
-            api_key: Google Gemini API key
-            model: Gemini model name
-        """
-        self.api_key = api_key
-        self.model = model
-        self.client = None
-        self.conversation_history = []
-        
-    def initialize(self):
-        """Set up the Gemini client."""
+        self.api_key  = api_key
+        self.model    = model
+        self.client   = None
+        # Stores text-only turns {role, parts:[{text}]} for multi-turn context
+        self.conversation_history: list[dict] = []
+
+    def initialize(self) -> bool:
         try:
             self.client = genai.Client(api_key=self.api_key)
-            print(f"✅ Gemini client initialized (model: {self.model})")
+            print(f"Gemini client ready  (model: {self.model})")
             return True
-        except Exception as e:
-            print(f"❌ Failed to initialize Gemini: {e}")
+        except Exception as exc:
+            print(f"Failed to init Gemini: {exc}")
             return False
-    
-    def stream_response(self, prompt: str) -> Generator[str, None, None]:
+
+    def stream_response(
+        self,
+        prompt:      str,
+        image_bytes: Optional[bytes] = None,
+    ) -> Generator[str, None, None]:
         """
-        Stream a response from Gemini.
-        
+        Stream a response from Gemini, optionally with a camera image.
+
+        The current turn is built as a multimodal Content object:
+          [ImagePart (if provided), TextPart]
+
+        Previous turns are included as text-only history so the model
+        retains conversational context without bloating the request.
+
         Args:
-            prompt: User's text prompt
-            
+            prompt:      Transcribed user speech.
+            image_bytes: In-memory JPEG bytes from the camera (optional).
+
         Yields:
-            Text chunks as they arrive from the API
+            Text chunks as they stream back from the API.
         """
         if not self.client:
-            print("❌ Gemini client not initialized!")
+            print("Gemini client not initialised!")
             return
-        
-        print("\n🤖 Generating response...")
-        
+
+        has_image = image_bytes is not None and len(image_bytes) > 0
+        mode_tag  = "vision + text" if has_image else "text-only"
+        print(f"\nGenerating response  [{mode_tag}]...")
+
         try:
-            # Add user message to history
-            self.conversation_history.append({
-                "role": "user",
-                "parts": [{"text": prompt}]
-            })
-            
-            # Create the streaming request
+            # --- Build the current-turn parts --------------------------------
+            # We always put the image FIRST (Gemini attends to leading parts
+            # more reliably) and the text question second.
+            current_parts: list[genai_types.Part] = []
+
+            if has_image:
+                # Inline the JPEG bytes as a Blob — no file upload needed
+                current_parts.append(
+                    genai_types.Part(
+                        inline_data=genai_types.Blob(
+                            mime_type="image/jpeg",
+                            data=image_bytes,
+                        )
+                    )
+                )
+
+            current_parts.append(genai_types.Part(text=prompt))
+
+            # --- Assemble full contents list --------------------------------
+            # History contains previous text-only turns (no images).
+            # We append the current multimodal turn at the end.
+            contents = list(self.conversation_history) + [
+                genai_types.Content(role="user", parts=current_parts)
+            ]
+
+            # --- Stream from Gemini -----------------------------------------
             response = self.client.models.generate_content_stream(
                 model=self.model,
-                contents=self.conversation_history,
-                config=types.GenerateContentConfig(
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     temperature=0.7,
-                    max_output_tokens=1024,  # Increased to avoid truncation
-                )
+                    max_output_tokens=1024,
+                ),
             )
-            
-            # Collect full response for history
+
             full_response = ""
-            
-            # Stream chunks as they arrive
             for chunk in response:
                 if chunk.text:
                     full_response += chunk.text
                     yield chunk.text
-            
-            # Add assistant response to history
+
+            # --- Update history (text-only) ---------------------------------
+            # Store the current turn as text in history so future turns have
+            # conversational context without re-sending the image.
             self.conversation_history.append({
-                "role": "model",
-                "parts": [{"text": full_response}]
+                "role":  "user",
+                "parts": [{"text": prompt}],
             })
-            
-            print(f"\n   💬 Assistant: {full_response}")
-            
-        except Exception as e:
-            print(f"❌ Gemini error: {e}")
+            self.conversation_history.append({
+                "role":  "model",
+                "parts": [{"text": full_response}],
+            })
+
+            print(f"\n   Assistant: {full_response}")
+
+        except Exception as exc:
+            print(f"Gemini error: {exc}")
             yield "I'm sorry, I encountered an error processing your request."
-    
+
     def clear_history(self):
-        """Clear the conversation history."""
+        """Reset the conversation context."""
         self.conversation_history = []
-        print("🗑️  Conversation history cleared")
+        print("Conversation history cleared")
 
 
 # =============================================================================
-# TEXT-TO-SPEECH (ELEVENLABS)
+# TEXT-TO-SPEECH (ELEVENLABS — STREAMING)
 # =============================================================================
 
 class TextToSpeech:
     """
-    Streaming text-to-speech using ElevenLabs.
-    Converts text to speech with minimal latency.
+    Streaming TTS via ElevenLabs with sentence-level buffering.
+
+    speak_streaming() runs a background worker thread that converts
+    complete sentences to audio as fast as the LLM can produce them,
+    so the first audio chunk plays while Gemini is still generating.
     """
-    
+
     def __init__(self, api_key: str, voice_id: str = ELEVENLABS_VOICE_ID):
-        """
-        Initialize the ElevenLabs client.
-        
-        Args:
-            api_key: ElevenLabs API key
-            voice_id: ID of the voice to use
-        """
-        self.api_key = api_key
+        self.api_key  = api_key
         self.voice_id = voice_id
-        self.client = None
-        
-    def initialize(self):
-        """Set up the ElevenLabs client."""
+        self.client   = None
+
+    def initialize(self) -> bool:
         try:
             self.client = ElevenLabs(api_key=self.api_key)
-            print(f"✅ ElevenLabs client initialized (voice: {self.voice_id})")
+            print(f"ElevenLabs client ready  (voice: {self.voice_id})")
             return True
-        except Exception as e:
-            print(f"❌ Failed to initialize ElevenLabs: {e}")
+        except Exception as exc:
+            print(f"Failed to init ElevenLabs: {exc}")
             return False
-    
+
     def speak_streaming(self, text_generator: Generator[str, None, None]):
         """
-        Stream text to speech with sentence buffering.
-        
-        This method buffers incoming text chunks until complete sentences
-        are formed, then streams those sentences to ElevenLabs for
-        minimum latency audio playback.
-        
-        Args:
-            text_generator: Generator yielding text chunks from LLM
+        Buffer LLM text chunks into sentences and play them via ElevenLabs.
+
+        Architecture:
+          Main thread  → collects text chunks → enqueues complete sentences
+          Worker thread → dequeues sentences   → streams TTS → plays audio
+
+        This pipeline means audio starts playing as soon as the FIRST
+        sentence is ready, not when the full response is complete.
         """
         if not self.client:
-            print("❌ ElevenLabs client not initialized!")
+            print("ElevenLabs client not initialised!")
             return
-        
-        print("\n🔊 Speaking response...")
-        
-        # Buffer for accumulating text until we have complete sentences
-        text_buffer = ""
-        
-        # Queue for sentences ready to be spoken
-        sentence_queue = queue.Queue()
-        
-        # Flag to signal when LLM streaming is complete
+
+        print("\nSpeaking...")
+
+        text_buffer        = ""
+        sentence_queue     = queue.Queue()
         streaming_complete = threading.Event()
-        
+
         def tts_worker():
-            """Worker thread that converts sentences to speech."""
+            """Dequeue sentences and play them sequentially."""
             while True:
                 try:
-                    # Wait for a sentence (with timeout to check completion)
                     sentence = sentence_queue.get(timeout=0.1)
-                    
-                    if sentence is None:
-                        # Poison pill - exit thread
+
+                    if sentence is None:           # poison pill — exit
                         break
-                    
-                    # Stream this sentence through ElevenLabs
-                    # Use the 'stream' method which returns an audio iterator
+
                     audio_stream = self.client.text_to_speech.stream(
                         voice_id=self.voice_id,
                         text=sentence,
-                        model_id="eleven_turbo_v2_5",  # Fastest model
-                        output_format="pcm_16000",     # Match our sample rate
+                        model_id="eleven_turbo_v2_5",   # lowest latency model
+                        output_format="pcm_16000",       # matches SAMPLE_RATE
                     )
-                    
-                    # Play the audio stream
                     self._play_audio_stream(audio_stream)
-                    
                     sentence_queue.task_done()
-                    
+
                 except queue.Empty:
-                    # Check if streaming is complete and queue is empty
                     if streaming_complete.is_set() and sentence_queue.empty():
                         break
-                except Exception as e:
-                    print(f"⚠️  TTS error: {e}")
+                except Exception as exc:
+                    print(f"TTS worker error: {exc}")
                     sentence_queue.task_done()
-        
-        # Start TTS worker thread
+
         tts_thread = threading.Thread(target=tts_worker, daemon=True)
         tts_thread.start()
-        
+
         try:
-            # Process incoming text chunks
             for chunk in text_generator:
                 text_buffer += chunk
-                
-                # Try to extract complete sentences
                 sentences, text_buffer = parse_sentences(text_buffer)
-                
-                # Queue complete sentences for TTS
                 for sentence in sentences:
                     if sentence.strip():
                         sentence_queue.put(sentence.strip())
-            
-            # Handle any remaining text in buffer
+
+            # Flush any trailing text that didn't end with punctuation
             if text_buffer.strip():
                 sentence_queue.put(text_buffer.strip())
-            
-            # Signal completion
+
             streaming_complete.set()
-            
-            # Wait for TTS to finish
             tts_thread.join(timeout=60)
-            
-        except Exception as e:
-            print(f"❌ TTS streaming error: {e}")
+
+        except Exception as exc:
+            print(f"TTS streaming error: {exc}")
             streaming_complete.set()
-    
+
     def _play_audio_stream(self, audio_stream):
-        """
-        Play audio from a streaming source.
-        
-        Args:
-            audio_stream: Iterator yielding audio chunks
-        """
-        # Collect audio chunks
-        audio_data = b""
-        for chunk in audio_stream:
-            audio_data += chunk
-        
+        """Collect PCM chunks from ElevenLabs and play via sounddevice."""
+        audio_data = b"".join(audio_stream)
         if audio_data:
-            # Convert to numpy array (PCM 16-bit)
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            
-            # Play through sounddevice
             sd.play(audio_array, samplerate=16000)
             sd.wait()
-    
+
     def speak(self, text: str):
-        """
-        Convert text to speech and play it (non-streaming fallback).
-        
-        Args:
-            text: Text to speak
-        """
+        """Non-streaming TTS — useful for short status phrases."""
         if not self.client:
-            print("❌ ElevenLabs client not initialized!")
             return
-        
         try:
-            audio = self.client.text_to_speech.convert(
+            audio    = self.client.text_to_speech.convert(
                 voice_id=self.voice_id,
                 text=text,
                 model_id="eleven_turbo_v2_5",
                 output_format="pcm_16000",
             )
-            
-            # Collect all audio data
-            audio_data = b"".join(audio)
+            audio_data  = b"".join(audio)
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            
             sd.play(audio_array, samplerate=16000)
             sd.wait()
-            
-        except Exception as e:
-            print(f"❌ TTS error: {e}")
+        except Exception as exc:
+            print(f"TTS error: {exc}")
 
 
 # =============================================================================
@@ -769,106 +832,169 @@ class TextToSpeech:
 
 class VoiceAssistant:
     """
-    Main voice assistant orchestrating all components.
+    Orchestrates all pipeline components.
+
+    Execution flow per interaction:
+      1. Wake word detected
+      2. PARALLEL: AudioRecorder.record() + CameraCapture.capture_to_memory()
+         — both launched in threads at the same instant so no audio is lost
+           while the camera initialises (camera is already warm).
+      3. faster-whisper transcribes the audio
+      4. Gemini receives text + JPEG image (or text-only if camera disabled)
+      5. ElevenLabs TTS plays the response as it streams
     """
-    
+
     def __init__(self):
-        """Initialize all components."""
-        # Wake word uses openwakeword - fully local, no API key!
         self.wake_detector = WakeWordDetector(
             model_name=WAKE_WORD_MODEL,
             threshold=WAKE_WORD_THRESHOLD,
-            display_name=WAKE_WORD_DISPLAY
+            display_name=WAKE_WORD_DISPLAY,
         )
         self.recorder = AudioRecorder()
-        self.stt = SpeechToText(WHISPER_MODEL)
-        self.llm = GeminiLLM(GEMINI_API_KEY, GEMINI_MODEL)
-        self.tts = TextToSpeech(ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID)
-        
+        self.stt      = SpeechToText(WHISPER_MODEL)
+        self.llm      = GeminiLLM(GEMINI_API_KEY, GEMINI_MODEL)
+        self.tts      = TextToSpeech(ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID)
+        self.camera   = CameraCapture() if CAMERA_ENABLED else None
+
     def initialize(self) -> bool:
         """
-        Initialize all components.
-        
-        Returns:
-            True if all components initialized successfully
+        Initialize all components in order.
+        Camera is initialized last — it has the longest warm-up but is
+        non-fatal (we fall back to audio-only if it fails).
         """
-        print("\n" + "=" * 60)
-        print("🚀 INITIALIZING VOICE ASSISTANT")
-        print("=" * 60 + "\n")
-        
-        # Show available audio devices for debugging
+        print("\n" + "=" * 62)
+        print("  INITIALIZING MULTIMODAL VOICE ASSISTANT")
+        print("=" * 62 + "\n")
+
         get_audio_devices()
-        
-        # Initialize each component
+
         if not self.wake_detector.initialize():
             return False
-        
+
         if not self.stt.initialize():
             return False
-        
+
         if not self.llm.initialize():
             return False
-        
+
         if not self.tts.initialize():
             return False
-        
-        print("\n" + "=" * 60)
-        print("✅ ALL COMPONENTS INITIALIZED SUCCESSFULLY")
-        print("=" * 60 + "\n")
-        
+
+        # Camera is optional — failure here is a warning, not a fatal error
+        if self.camera is not None:
+            camera_ok = self.camera.initialize()
+            if not camera_ok:
+                print("Continuing without camera (audio-only mode).")
+                self.camera = None
+
+        print("\n" + "=" * 62)
+        mode = "VISION + AUDIO" if self.camera else "AUDIO-ONLY"
+        print(f"  ALL COMPONENTS READY  [{mode}]")
+        print("=" * 62 + "\n")
         return True
-    
+
+    def _capture_parallel(self) -> tuple[Optional[np.ndarray], Optional[bytes]]:
+        """
+        Launch audio recording and camera capture simultaneously.
+
+        Why this matters for latency:
+          - Audio recording MUST start first (or at the same time) so the
+            user's opening words are captured.
+          - Camera capture is fast (~0.1 s) because the camera is already
+            in continuous-AF preview mode. It typically finishes long before
+            the user finishes speaking.
+          - Running them in separate threads means neither blocks the other.
+
+        Returns:
+            (audio_array, jpeg_bytes) — either may be None on failure.
+        """
+        audio_result: list[Optional[np.ndarray]] = [None]
+        image_result: list[Optional[bytes]]       = [None]
+
+        def record_fn():
+            audio_result[0] = self.recorder.record()
+
+        def capture_fn():
+            if self.camera is not None:
+                image_result[0] = self.camera.capture_to_memory()
+
+        # Start audio thread FIRST — we want mic capture to begin
+        # before the camera thread even allocates its buffer.
+        audio_thread  = threading.Thread(target=record_fn,  daemon=True)
+        camera_thread = threading.Thread(target=capture_fn, daemon=True)
+
+        audio_thread.start()
+        camera_thread.start()
+
+        # Wait for both to finish — audio is the long pole here
+        audio_thread.join()
+        camera_thread.join()
+
+        return audio_result[0], image_result[0]
+
     def run(self):
-        """
-        Main loop - listen for wake word, process speech, respond.
-        """
-        print("\n🎯 Voice Assistant is ready!")
-        print(f"   Say '{WAKE_WORD_DISPLAY}' to start...")
+        """Main loop."""
+        print("Voice Assistant is ready!")
+        print(f"   Say '{WAKE_WORD_DISPLAY}' to activate...")
         print("   Press Ctrl+C to exit\n")
-        
+
         try:
             while True:
-                # Step 1: Listen for wake word
+                # ── Step 1: Wait for wake word ─────────────────────────────
                 if not self.wake_detector.listen_for_wake_word():
-                    print("⚠️  Wake word detection failed, retrying...")
+                    print("Wake word detection failed — retrying...")
                     time.sleep(1)
                     continue
-                
-                # Optional: Play a "listening" sound here
-                # self.tts.speak("Yes?")
-                
-                # Step 2: Record user's speech
-                audio = self.recorder.record()
+
+                # ── Step 2: Record audio + capture image IN PARALLEL ───────
+                # Both threads start at (virtually) the same time.
+                # Audio recording will catch the user's first words because
+                # the camera is already warm and just grabs the current frame.
+                print("\nCapturing audio and image simultaneously...")
+                audio, image_bytes = self._capture_parallel()
+
                 if audio is None or len(audio) < SAMPLE_RATE * 0.5:
-                    print("⚠️  Recording too short or failed")
+                    print("Recording too short or failed — ready again.")
                     continue
-                
-                # Step 3: Transcribe speech to text
+
+                # ── Step 3: Transcribe ─────────────────────────────────────
                 text = self.stt.transcribe(audio)
                 if not text.strip():
-                    print("⚠️  No speech detected")
-                    self.tts.speak("I didn't catch that. Please try again.")
+                    print("No speech detected.")
+                    self.tts.speak("I didn't catch that, Sir. Please try again.")
                     continue
-                
-                # Step 4 & 5: Stream to LLM and TTS simultaneously
-                # This is where the magic happens - we get the first audio
-                # playing before the LLM has finished generating!
-                response_generator = self.llm.stream_response(text)
-                self.tts.speak_streaming(response_generator)
-                
-                print("\n" + "-" * 40)
-                print(f"🎤 Say '{WAKE_WORD_DISPLAY}' for another question...")
-                print("-" * 40 + "\n")
-                
+
+                if image_bytes:
+                    kb = len(image_bytes) / 1024
+                    print(f"   Image ready: {kb:.0f} KB  — sending multimodal request")
+                else:
+                    print("   No image captured — sending text-only request")
+
+                # ── Step 4 & 5: Multimodal LLM → streaming TTS ────────────
+                # stream_response yields text tokens; speak_streaming pipes
+                # them into ElevenLabs as fast as complete sentences form,
+                # so audio playback begins before Gemini finishes generating.
+                response_gen = self.llm.stream_response(
+                    prompt=text,
+                    image_bytes=image_bytes,
+                )
+                self.tts.speak_streaming(response_gen)
+
+                print("\n" + "-" * 42)
+                print(f"   Say '{WAKE_WORD_DISPLAY}' for another question...")
+                print("-" * 42 + "\n")
+
         except KeyboardInterrupt:
-            print("\n\n👋 Shutting down Voice Assistant...")
+            print("\n\nShutting down...")
         finally:
             self.cleanup()
-    
+
     def cleanup(self):
-        """Clean up resources."""
+        """Release all hardware resources gracefully."""
         self.wake_detector.cleanup()
-        print("✅ Cleanup complete. Goodbye!")
+        if self.camera is not None:
+            self.camera.cleanup()
+        print("Goodbye!")
 
 
 # =============================================================================
@@ -876,37 +1002,33 @@ class VoiceAssistant:
 # =============================================================================
 
 def main():
-    """Main entry point."""
     print("""
-╔══════════════════════════════════════════════════════════════╗
-║           🎙️  RASPBERRY PI VOICE ASSISTANT 🎙️              ║
-║                                                              ║
-║  Wake Word Detection → Local STT → Streaming LLM → TTS      ║
-║                                                              ║
-║  Hardware: ReSpeaker Mic Array v3.0 + USB Speakers           ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║        RASPBERRY PI 5 — MULTIMODAL VOICE ASSISTANT               ║
+║                                                                  ║
+║  Wake Word  →  Audio + Camera (parallel)  →  Whisper STT         ║
+║             →  Gemini Vision + Text       →  ElevenLabs TTS       ║
+║                                                                  ║
+║  Hardware:  ReSpeaker v3.0  |  Arducam IMX708 (Camera Module 3)  ║
+╚══════════════════════════════════════════════════════════════════╝
     """)
-    
-    # Verify API keys are set (only Gemini and ElevenLabs needed now!)
-    # Wake word detection is fully local with openwakeword - no API key required!
-    
+
     if not GEMINI_API_KEY or "YOUR_" in GEMINI_API_KEY:
-        print("❌ ERROR: Please set your GEMINI_API_KEY in .env.local")
-        print("   Get one at: https://aistudio.google.com/apikey")
+        print("ERROR: Set GEMINI_API_KEY in .env.local")
+        print("       https://aistudio.google.com/apikey")
         sys.exit(1)
-    
+
     if not ELEVENLABS_API_KEY or "YOUR_" in ELEVENLABS_API_KEY:
-        print("❌ ERROR: Please set your ELEVENLABS_API_KEY in .env.local")
-        print("   Get one at: https://elevenlabs.io/app/settings/api-keys")
+        print("ERROR: Set ELEVENLABS_API_KEY in .env.local")
+        print("       https://elevenlabs.io/app/settings/api-keys")
         sys.exit(1)
-    
-    # Create and run assistant
+
     assistant = VoiceAssistant()
-    
+
     if assistant.initialize():
         assistant.run()
     else:
-        print("\n❌ Failed to initialize voice assistant")
+        print("\nFailed to initialize voice assistant")
         sys.exit(1)
 
 
