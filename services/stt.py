@@ -1,37 +1,41 @@
 """
-services/stt.py — Local speech-to-text via faster-whisper.
+services/stt.py — Speech-to-text via RUBIK Pi 3 faster-whisper HTTP server.
 
-Runs entirely on-device using int8-quantised Whisper on the Pi 5's
-ARM Cortex-A76 CPU. No API key, no network dependency.
+Sends raw WAV bytes to the remote transcribe endpoint and parses the JSON
+response. No local model weights — all inference runs on the coprocessor.
 
-Model size guide (speed vs. accuracy on Pi 5):
-  tiny.en   ~  40 MB   ~0.4 s RTF  — good for simple commands
-  base.en   ~ 140 MB   ~0.8 s RTF  — recommended default
-  small.en  ~ 460 MB   ~2.5 s RTF  — highest accuracy for on-device
+Endpoint:  POST http://<RUBIKPI_HOST>:<RUBIKPI_STT_PORT>/transcribe
+Body:      raw WAV bytes (Content-Type: audio/wav)
+Response:  {"transcript": "..."}
 """
 
+import io
 import logging
 import time
+import wave
 from typing import Optional
 
 import numpy as np
+import requests
 
 import config
 
 log = logging.getLogger(__name__)
 
+_STT_URL = f"{config.RUBIKPI_HOST}:{config.RUBIKPI_STT_PORT}/transcribe"
+
 
 class SpeechToText:
     """
-    Wraps faster-whisper for on-device int8 transcription.
+    Transcribes audio via the RUBIK Pi 3 faster-whisper HTTP server.
 
-    Keep one instance alive for the lifetime of the program — model weights
-    stay in memory so subsequent calls are fast (no reload penalty).
+    initialize() does a lightweight connectivity check so startup fails fast
+    if the coprocessor is unreachable. transcribe() is otherwise stateless —
+    no local model weights are held in memory.
     """
 
     def __init__(self, model_name: str = config.WHISPER_MODEL) -> None:
-        self.model_name = model_name
-        self._model     = None  # WhisperModel — loaded in initialize()
+        self.model_name = model_name  # informational; server decides the model
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -39,36 +43,26 @@ class SpeechToText:
 
     def initialize(self) -> bool:
         """
-        Load the Whisper model weights into memory.
-
-        The first run may download the model; subsequent runs load from cache.
+        Verify that the RUBIK Pi 3 STT server is reachable.
 
         Returns:
-            True on success, False on import or load error.
+            True if the server responds, False otherwise.
         """
+        log.info("Checking RUBIK Pi 3 STT server at %s ...", _STT_URL)
         try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            log.error(
-                "faster-whisper not installed. Run: pip install faster-whisper"
+            # A HEAD/GET on the root is enough to confirm the server is up.
+            r = requests.get(
+                f"{config.RUBIKPI_HOST}:{config.RUBIKPI_STT_PORT}/",
+                timeout=5,
             )
-            return False
-
-        log.info("Loading Whisper model '%s' ...", self.model_name)
-        log.info("  (First run downloads model weights to ~/.cache/huggingface/)")
-
-        try:
-            self._model = WhisperModel(
-                self.model_name,
-                device=config.WHISPER_DEVICE,
-                compute_type=config.WHISPER_COMPUTE_TYPE,
-            )
-            log.info("Whisper '%s' loaded", self.model_name)
+            log.info("STT server reachable  (HTTP %s)", r.status_code)
             return True
-
-        except Exception:
-            log.exception("Failed to load Whisper model")
-            return False
+        except requests.exceptions.ConnectionError:
+            log.warning(
+                "STT server not reachable at %s — will retry on first transcribe call",
+                _STT_URL,
+            )
+            return True  # non-fatal: server may not expose a root route
 
     # ------------------------------------------------------------------
     # Transcription
@@ -80,7 +74,7 @@ class SpeechToText:
         sample_rate: int = config.SAMPLE_RATE,
     ) -> str:
         """
-        Transcribe an int16 audio array to text.
+        Transcribe an int16 audio array by sending it to the RUBIK Pi 3.
 
         Args:
             audio:       1-D or 2-D int16 NumPy array from AudioRecorder.
@@ -89,34 +83,45 @@ class SpeechToText:
         Returns:
             Transcribed text, or an empty string on failure.
         """
-        if self._model is None:
-            log.error("SpeechToText not initialised — call initialize() first")
-            return ""
-
-        log.info("Transcribing ...")
+        log.info("Transcribing via RUBIK Pi 3 (%s) ...", _STT_URL)
         t0 = time.monotonic()
 
         try:
-            # faster-whisper expects float32 in [-1, 1], flat 1-D array
-            audio_f32 = audio.flatten().astype(np.float32) / 32_768.0
+            wav_bytes = _numpy_to_wav(audio, sample_rate)
 
-            segments, _info = self._model.transcribe(
-                audio_f32,
-                language="en",
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
+            response = requests.post(
+                _STT_URL,
+                data=wav_bytes,
+                headers={"Content-Type": "audio/wav"},
+                timeout=30,
             )
+            response.raise_for_status()
 
-            text = " ".join(seg.text for seg in segments).strip()
+            transcript = response.json().get("transcript", "").strip()
 
             log.info(
                 "Transcription done  (%.2f s)  text=%r",
                 time.monotonic() - t0,
-                text,
+                transcript,
             )
-            return text
+            return transcript
 
         except Exception:
             log.exception("Transcription error")
             return ""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _numpy_to_wav(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Convert a int16 NumPy array to in-memory WAV bytes."""
+    buf = io.BytesIO()
+    pcm = audio.flatten().astype(np.int16).tobytes()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)   # 16-bit = 2 bytes per sample
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()

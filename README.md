@@ -1,7 +1,7 @@
-# Multimodal Voice Assistant — Raspberry Pi 5
+# Multimodal Voice Assistant — Raspberry Pi 5 + RUBIK Pi 3
 
-A low-latency, fully local voice + vision assistant pipeline running on Raspberry Pi 5.  
-Speaks, listens, and **sees** — powered by Gemini 2.5 Flash, ElevenLabs, and a 12 MP autofocus camera.
+A low-latency voice + vision assistant pipeline running on Raspberry Pi 5 with a RUBIK Pi 3 (Qualcomm QCS6490) as an AI coprocessor.  
+Speaks, listens, and **sees** — STT and LLM inference offloaded to the RUBIK Pi 3, TTS via ElevenLabs, vision via a 12 MP autofocus camera.
 
 ---
 
@@ -12,6 +12,7 @@ Speaks, listens, and **sees** — powered by Gemini 2.5 Flash, ElevenLabs, and a
 | Component | Model | Interface |
 |---|---|---|
 | Single-board computer | Raspberry Pi 5 (4 GB / 8 GB) | — |
+| AI Coprocessor | RUBIK Pi 3 (Qualcomm QCS6490) | Ethernet/Wi-Fi |
 | Microphone array | ReSpeaker Mic Array v3.0 | USB |
 | Speaker | Amazon Basics USB-powered speaker | 3.5 mm (ReSpeaker jack) |
 | Camera | Arducam IMX708 (Camera Module 3) — 12 MP, Autofocus | 15–22 pin FFC MIPI CSI-2 |
@@ -21,27 +22,28 @@ Speaks, listens, and **sees** — powered by Gemini 2.5 Flash, ElevenLabs, and a
 
 ### Software Stack
 
-| Layer | Library | Notes |
+| Layer | Library / Service | Notes |
 |---|---|---|
-| Wake word | `openwakeword` | Fully local — no API key, no cloud |
+| Wake word | `openwakeword` | Fully local on Pi 5 — no API key, no cloud |
 | Audio I/O | `sounddevice` | Direct ALSA access via libportaudio |
 | Camera | `picamera2` | Official libcamera Python wrapper for Pi 5 |
-| Speech-to-text | `faster-whisper` | Local int8-quantised Whisper on CPU |
-| LLM (multimodal) | `google-genai` | Gemini 2.5 Flash — text + inline JPEG |
+| Speech-to-text | `faster-whisper` on RUBIK Pi 3 | Remote HTTP — int8 Whisper on QCS6490 NPU |
+| LLM | Phi-3 Mini (Dolphin) via `llama-server` on RUBIK Pi 3 | Remote HTTP — OpenAI-compatible endpoint |
 | Text-to-speech | `elevenlabs` | Streaming PCM → sounddevice playback |
 
 ### Execution Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  1. PASSIVE LOOP                                            │
+│  1. PASSIVE LOOP  (Raspberry Pi 5)                          │
 │     openwakeword feeds 80 ms audio chunks until             │
 │     "Hey Jarvis" is detected (score ≥ threshold)            │
 └────────────────────┬────────────────────────────────────────┘
                      │ wake word fired
                      ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  2. PARALLEL CAPTURE  (two threads, started simultaneously)  │
+│  2. PARALLEL CAPTURE  (Raspberry Pi 5)                       │
+│     Two threads, started simultaneously                      │
 │                                                              │
 │   Thread A — AudioRecorder                                   │
 │     sounddevice InputStream → VAD silence detection →        │
@@ -56,25 +58,26 @@ Speaks, listens, and **sees** — powered by Gemini 2.5 Flash, ElevenLabs, and a
                      │
                      ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  3. TRANSCRIBE                                              │
-│     faster-whisper (int8 CPU) → text string                 │
+│  3. TRANSCRIBE  (RUBIK Pi 3 — Qualcomm QCS6490)             │
+│     Pi 5 → POST /transcribe (raw WAV bytes)                 │
+│     faster-whisper on RUBIK Pi 3 → JSON {"transcript":"…"}  │
 └────────────────────┬────────────────────────────────────────┘
                      │
                      ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  4. MULTIMODAL LLM REQUEST                                  │
-│     Gemini 2.5 Flash                                        │
-│       contents: [ImagePart (JPEG), TextPart (transcript)]   │
-│       + conversation history (text-only turns)              │
-│     → streaming token generator                             │
+│  4. LLM REQUEST  (RUBIK Pi 3 — Qualcomm QCS6490)            │
+│     Pi 5 → POST /v1/chat/completions (OpenAI-compat SSE)    │
+│     Phi-3 Mini Q4 via llama-server                          │
+│       messages: [system, history…, user transcript]         │
+│     → streaming token generator (SSE)                       │
 └────────────────────┬────────────────────────────────────────┘
                      │
                      ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  5. STREAMING TTS                                           │
+│  5. STREAMING TTS  (Raspberry Pi 5 + ElevenLabs cloud)      │
 │     Tokens → sentence buffer → ElevenLabs Turbo v2.5 →      │
 │     PCM 16 kHz → sounddevice playback                       │
-│     (first audio plays before Gemini finishes generating)   │
+│     (first audio plays before LLM finishes generating)      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -151,8 +154,7 @@ pip install \
   sounddevice \
   numpy \
   openwakeword \
-  faster-whisper \
-  google-genai \
+  requests \
   elevenlabs \
   python-dotenv \
   picamera2        # skip if installed via apt + system-site-packages
@@ -198,6 +200,74 @@ python voice_assistant.py
 ```
 
 Say **"Hey Jarvis"** to activate.
+
+---
+
+## RUBIK Pi 3 Setup
+
+The RUBIK Pi 3 (Qualcomm QCS6490) acts as the AI coprocessor, running both the
+STT and LLM inference servers. The Pi 5 reaches it over the local network.
+
+**Assumed IP address:** `192.168.4.28`  
+To change this, update `RUBIKPI_HOST` in [config.py](config.py).
+
+### STT server — faster-whisper HTTP
+
+Runs on port **8000**. Accepts raw WAV bytes, returns a JSON transcript.
+
+```bash
+# On the RUBIK Pi 3
+pip install faster-whisper flask
+
+python3 - <<'EOF'
+from flask import Flask, request, jsonify
+import tempfile, os
+from faster_whisper import WhisperModel
+
+app = Flask(__name__)
+model = WhisperModel("base.en", device="cpu", compute_type="int8")
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe():
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(request.data)
+        tmp = f.name
+    try:
+        segments, _ = model.transcribe(tmp, language="en")
+        text = " ".join(s.text for s in segments).strip()
+    finally:
+        os.unlink(tmp)
+    return jsonify({"transcript": text})
+
+app.run(host="0.0.0.0", port=8000)
+EOF
+```
+
+**Endpoint summary:**
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| POST | `/transcribe` | raw WAV bytes (`Content-Type: audio/wav`) | `{"transcript": "..."}` |
+
+### LLM server — llama-server (Phi-3 Mini Q4)
+
+Runs on port **8080** with an OpenAI-compatible API.
+
+```bash
+# On the RUBIK Pi 3 — download llama.cpp and a Phi-3 Mini GGUF model first
+./llama-server \
+  --model ./phi-3-mini-4k-instruct-q4.gguf \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --ctx-size 4096
+```
+
+**Endpoint summary:**
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| POST | `/v1/chat/completions` | OpenAI Chat Completions JSON (`"stream": true`) | SSE token stream |
+| GET  | `/health` | — | `{"status": "ok"}` |
 
 ---
 

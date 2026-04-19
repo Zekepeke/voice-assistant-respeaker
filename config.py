@@ -1,4 +1,4 @@
-"""
+`"""
 config.py — Single source of truth for all settings and environment variables.
 
 Every tunable constant lives here. No module should hard-code values or call
@@ -50,7 +50,14 @@ MIN_RECORDING_DURATION: float = 0.5   # Don't check silence until after this
 RECORDING_CHUNK_MS:     int   = 100   # Audio chunk size in milliseconds
 
 # =============================================================================
-# SPEECH-TO-TEXT  (faster-whisper — local)
+# RUBIK Pi 3  (AI coprocessor — Qualcomm QCS6490)
+# =============================================================================
+RUBIKPI_HOST:     str = "http://192.168.4.28"
+RUBIKPI_STT_PORT: int = 8000   # faster-whisper HTTP server  (POST /transcribe)
+RUBIKPI_LLM_PORT: int = 8080   # llama-server OpenAI-compat  (POST /v1/chat/completions)
+
+# =============================================================================
+# SPEECH-TO-TEXT  (faster-whisper running remotely on RUBIK Pi 3)
 # =============================================================================
 # Options: "tiny.en" (fastest) → "base.en" → "small.en" → "medium.en" (slowest)
 WHISPER_MODEL:        str = "base.en"
@@ -58,11 +65,16 @@ WHISPER_DEVICE:       str = "cpu"
 WHISPER_COMPUTE_TYPE: str = "int8"  # int8 quantisation for ARM Cortex-A76
 
 # =============================================================================
-# LLM  (Google Gemini)
+# LLM  (Phi-3 Mini via llama-server on RUBIK Pi 3)
 # =============================================================================
 GEMINI_MODEL:       str = "gemini-2.5-flash"
 GEMINI_TEMPERATURE: float = 0.7
 GEMINI_MAX_TOKENS:  int   = 1_024
+
+LLM_SYSTEM_PROMPT: str = (
+    "You are Jarvis, a direct and unfiltered voice assistant. "
+    "Be concise, blunt, and skip unnecessary disclaimers."
+)
 
 SYSTEM_PROMPT: str = (
     "You are an exceptionally sophisticated, British-accented AI assistant "

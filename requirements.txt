@@ -2,7 +2,7 @@
 # VOICE ASSISTANT DEPENDENCIES
 # =============================================================================
 # Install with: pip install -r requirements.txt
-# 
+#
 # Note: Some packages may require system dependencies (see setup.sh)
 # =============================================================================
 
@@ -12,11 +12,8 @@ sounddevice>=0.4.6
 # Wake Word Detection (fully local, open-source, no API key!)
 openwakeword>=0.6.0
 
-# Local Speech-to-Text (faster-whisper)
-faster-whisper>=1.0.0
-
-# LLM (Google Gemini)
-google-genai>=0.1.0
+# HTTP client — used to call RUBIK Pi 3 STT and LLM servers
+requests>=2.31.0
 
 # Text-to-Speech (ElevenLabs)
 elevenlabs>=1.0.0
