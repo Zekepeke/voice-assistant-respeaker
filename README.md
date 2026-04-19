@@ -255,11 +255,12 @@ Runs on port **8080** with an OpenAI-compatible API.
 
 ```bash
 # On the RUBIK Pi 3 — download llama.cpp and a Phi-3 Mini GGUF model first
-./llama-server \
-  --model ./phi-3-mini-4k-instruct-q4.gguf \
+cd ~/dev/llm/llama.cpp
+./build/bin/llama-server \
+  -m ~/dev/llm/models/Dolphin3.0-Llama3.1-8B-Q4_K_M.gguf \
   --host 0.0.0.0 \
   --port 8080 \
-  --ctx-size 4096
+  --ctx-size 2048
 ```
 
 **Endpoint summary:**
