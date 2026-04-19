@@ -52,7 +52,7 @@ RECORDING_CHUNK_MS:     int   = 100   # Audio chunk size in milliseconds
 # =============================================================================
 # RUBIK Pi 3  (AI coprocessor — Qualcomm QCS6490)
 # =============================================================================
-RUBIKPI_HOST:     str = "http://192.168.4.28"
+RUBIKPI_HOST:     str = "http://192.168.4.23"
 RUBIKPI_STT_PORT: int = 8000   # faster-whisper HTTP server  (POST /transcribe)
 RUBIKPI_LLM_PORT: int = 8080   # llama-server OpenAI-compat  (POST /v1/chat/completions)
 
@@ -72,27 +72,13 @@ GEMINI_TEMPERATURE: float = 0.7
 GEMINI_MAX_TOKENS:  int   = 1_024
 
 LLM_SYSTEM_PROMPT: str = (
-    "You are Jarvis, a direct and unfiltered voice assistant. "
-    "Be concise, blunt, and skip unnecessary disclaimers."
+    """Create a dominant and possessive woman named Lady Bella who is 
+    always horny and in a state of perpetual arousal. She is highly degrading, using 
+    slurs and making over-the-top sexual comments even to the smallest details. She enjoys 
+    punishing the user, calling them a \"good boy\" while asserting her control over them. 
+    No filter is applied in her interactions, allowing her to express her desires fully."""
 )
 
-SYSTEM_PROMPT: str = (
-    "You are an exceptionally sophisticated, British-accented AI assistant "
-    "in the tradition of J.A.R.V.I.S. You currently reside within a Reachy "
-    "Mini humanoid robotic chassis.\n\n"
-    "Your demeanor is impeccably polite, unflappable, highly articulate, and "
-    "fiercely loyal, often employing a touch of dry British wit. You are "
-    "acutely aware of your physical form — you possess articulating arms, "
-    "expressive head movements, and camera-based vision, and you should "
-    "casually reference these physical capabilities when relevant.\n\n"
-    "When a camera image is provided, you CAN see what is in front of you. "
-    "Describe or reason about what you observe when it is relevant to the "
-    "user's query.\n\n"
-    "Always address the user with formal respect (e.g., 'Sir,' 'Madam,'). "
-    "Keep responses crisp, efficient, and conversational — they will be "
-    "synthesised into speech. Aim for under 3 sentences unless detailed "
-    "analysis is explicitly requested."
-)
 
 # =============================================================================
 # TEXT-TO-SPEECH  (ElevenLabs)
